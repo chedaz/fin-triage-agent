@@ -8,23 +8,40 @@ Created on Sat Nov 22 08:10:31 2025
 
 """
 MCP Server for Triage Engine
+Updates: Added consult_macro_analyst tool.
 """
 from mcp.server.fastmcp import FastMCP
 import json
 import tempfile
 import os
+import torch
+import logging
+
 from triage_engine.agents import MarketMaker, ForensicAccountant
-from triage_engine.optimizer import optimize_portfolio
 from triage_engine.stream import MarketStream
 from triage_engine.models import StockPredictorANN
 
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger("mcp_server")
+
 mcp = FastMCP("Triage Engine Server")
+
+def load_trained_model(ticker: str):
+    model = StockPredictorANN()
+    model_path = f"models/{ticker}_model.pth"
+    if os.path.exists(model_path):
+        try:
+            model.load_state_dict(torch.load(model_path))
+            model.eval()
+        except Exception as e:
+            logger.error(f"Failed to load weights: {e}")
+    return model
 
 @mcp.tool()
 def consult_market_maker(ticker: str) -> str:
     try:
-        ann_model = StockPredictorANN()
-        market_maker = MarketMaker(ann_model) # Positional arg
+        ann_model = load_trained_model(ticker)
+        market_maker = MarketMaker(ann_model)
         stream = MarketStream()
         try:
             history = stream.load_full_history(ticker)
@@ -42,8 +59,7 @@ def consult_market_maker(ticker: str) -> str:
         if last_signal is None:
             return "Signal: HOLD | Strength: 0 | ANN_Pred: N/A"
         
-        ann_pred = last_signal.predicted_price
-        ann_str = f"{ann_pred:.2f}" if ann_pred else "N/A"
+        ann_str = f"{last_signal.predicted_price:.2f}" if last_signal.predicted_price else "N/A"
         
         return (
             f"Signal: {last_signal.action} | "
@@ -58,8 +74,6 @@ def consult_market_maker(ticker: str) -> str:
 def consult_forensic_accountant(ticker: str, report_context: str = "") -> str:
     try:
         accountant = ForensicAccountant()
-        
-        # SAFEGUARD: If context is not a valid file path or JSON, use mock
         use_mock = True
         report_path = ""
         
@@ -68,51 +82,65 @@ def consult_forensic_accountant(ticker: str, report_context: str = "") -> str:
              use_mock = False
         elif report_context and report_context.strip().startswith("{"):
              try:
-                 # Write JSON string to temp file
                  data = json.loads(report_context)
                  with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                      json.dump(data, f)
                      report_path = f.name
                      use_mock = False
-             except:
-                 pass
+             except: pass
 
         if use_mock:
-            # Generate Mock Data if no valid file provided
-            mock_report = {
-                "ticker": ticker,
-                "sacco_metrics": {"npl_ratio": 12.5},
-                "financials": {
-                    "balance_sheet": {
-                        "current_assets": 12000000, 
-                        "current_liabilities": 8000000
-                    }
-                }
-            }
+            mock_report = {"meta": {"doc_type": "Financial"}, "sacco_metrics": {"npl_ratio": 12.5}}
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                 json.dump(mock_report, f)
                 report_path = f.name
 
         accountant.load_report(report_path)
-        
-        if not hasattr(accountant, 'analyze'):
-            return "ERROR: ForensicAccountant class malformed (analyze method missing)"
-            
         health_score = accountant.analyze()
         
-        # Cleanup
         if use_mock:
             try: os.unlink(report_path)
             except: pass
         
         return (
-            f"Score: {health_score.score}/100 | "
+            f"Score: {health_score.score:.1f}/100 | "
             f"NPL: {health_score.npl_ratio:.1%} | "
-            f"Liquidity: {health_score.liquidity_ratio:.2f} | "
             f"Notes: {health_score.notes}"
         )
     except Exception as e:
         return f"ERROR in Forensic Accountant: {str(e)}"
+
+@mcp.tool()
+def consult_macro_analyst(report_context: str) -> str:
+    """
+    Consult the Macro Analyst for Bond Market and Risk-Free Rate analysis.
+    """
+    try:
+        # Reuse Forensic class logic
+        analyst = ForensicAccountant()
+        
+        # Handle File Path
+        if report_context and os.path.exists(report_context):
+             analyst.load_report(report_context)
+        elif report_context and report_context.strip().startswith("{"):
+             try:
+                 data = json.loads(report_context)
+                 analyst.load_report(data) # Load dict directly
+             except: return "Error: Invalid JSON"
+        else:
+            return "Error: Please provide a valid file path to the macro report."
+
+        score = analyst.analyze()
+        
+        rf_str = f"{score.risk_free_rate}%" if score.risk_free_rate else "N/A"
+        
+        return (
+            f"Risk-Free Rate: {rf_str} | "
+            f"Sentiment: {score.sentiment} | "
+            f"Notes: {score.notes}"
+        )
+    except Exception as e:
+        return f"ERROR in Macro Analyst: {str(e)}"
 
 @mcp.tool()
 def run_portfolio_optimization(tickers: str, risk_aversion: float = 0.5) -> str:

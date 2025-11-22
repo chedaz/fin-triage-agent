@@ -1,15 +1,7 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Nov 22 07:42:15 2025
-
-@author: z3r0
-"""
-
 """
 Triage Manager Orchestrator (Universal)
 Supports: DeepSeek (via OpenAI SDK), Gemini (Google GenAI), and Anthropic.
-Fixed: Correctly handles MCP stdio_client context manager lifecycle.
+Updates: System Prompt explicitly authorizes passing file paths to tools.
 """
 import asyncio
 import os
@@ -32,17 +24,24 @@ except ImportError:
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# --- SYSTEM PROMPT ---
+# --- UPDATED SYSTEM PROMPT ---
 TRIAGE_MANAGER_PROMPT = """You are the **Triage Manager**, a Senior Portfolio Manager.
+
 YOUR IDENTITY:
 - Decisive, analytical, and risk-aware.
 - Prioritize capital preservation.
 - NEVER access raw data directly; rely exclusively on your tools.
 
 YOUR TOOLS:
-1. consult_market_maker: Technicals (price, momentum, ANN).
-2. consult_forensic_accountant: Fundamentals (health, flags).
-3. run_portfolio_optimization: Allocation strategy.
+1. consult_market_maker(ticker): Technicals (price, momentum, ANN).
+2. consult_forensic_accountant(ticker, report_context): Fundamentals.
+   - CRITICAL: The `report_context` argument accepts a FILE PATH or JSON string.
+   - If the user provides a file path (e.g., "/tmp/report.json"), PASS IT EXACTLY as written to this argument.
+   - Do not say "I cannot read files". Your tool CAN read files. Just pass the string.
+3. consult_macro_analyst(report_context): Macro/Bonds.
+   - Use this for CBK Auctions, Government Bonds, and Inflation data.
+   - Input is the FILE PATH to the macro report.
+3. run_portfolio_optimization(tickers, risk_aversion): Allocation strategy.
 
 DECISION MATRIX:
 - MM SELL + Forensic BUY -> HOLD/SELL (Respect the crash).
@@ -57,29 +56,22 @@ class BaseOrchestrator:
         self.session = None
         self.stdio = None
         self.write = None
-        self._stdio_ctx = None  # Internal context manager for transport
+        self._stdio_ctx = None
 
     async def connect_to_server(self, server_script_path: str):
         """Standard MCP Connection Logic"""
         server_params = StdioServerParameters(command="python", args=[server_script_path], env=None)
-        
-        # FIX: stdio_client is a context manager. We must manually enter it 
-        # to keep the connection open across method calls.
         self._stdio_ctx = stdio_client(server_params)
         self.stdio, self.write = await self._stdio_ctx.__aenter__()
 
-        # Initialize Session
         self.session = ClientSession(self.stdio, self.write)
         await self.session.__aenter__()
         await self.session.initialize()
         print(f"✓ Connected to MCP Server via {self.__class__.__name__}")
 
     async def disconnect(self):
-        """Clean up both Session and Transport contexts"""
         if self.session: 
             await self.session.__aexit__(None, None, None)
-        
-        # FIX: Properly exit the stdio context
         if self._stdio_ctx:
             await self._stdio_ctx.__aexit__(None, None, None)
 
@@ -95,7 +87,6 @@ class DeepSeekOrchestrator(BaseOrchestrator):
     async def query(self, user_question: str) -> str:
         self.conversation_history.append({"role": "user", "content": user_question})
         
-        # 1. Fetch Tools from MCP & Convert to OpenAI Format
         mcp_tools = await self.session.list_tools()
         openai_tools = []
         for tool in mcp_tools.tools:
@@ -108,7 +99,6 @@ class DeepSeekOrchestrator(BaseOrchestrator):
                 }
             })
 
-        # 2. Tool Loop
         while True:
             response = await self.client.chat.completions.create(
                 model="deepseek-chat",
@@ -127,10 +117,11 @@ class DeepSeekOrchestrator(BaseOrchestrator):
                 fargs = json.loads(tool_call.function.arguments)
                 
                 print(f"\n🔧 DeepSeek requesting: {fname}")
+                # Debug print to confirm args
+                print(f"   Args: {fargs}")
+                
                 try:
                     result = await self.session.call_tool(fname, fargs)
-                    
-                    # Extract text content properly from MCP result
                     content_str = "".join([c.text for c in result.content if hasattr(c, "text")])
                     print(f"   Result: {content_str[:100]}...")
                 except Exception as e:
@@ -155,8 +146,6 @@ class GeminiOrchestrator(BaseOrchestrator):
 
     async def connect_to_server(self, server_script_path: str):
         await super().connect_to_server(server_script_path)
-        
-        # Convert MCP Tools to Gemini Functions
         mcp_tools = await self.session.list_tools()
         gemini_funcs = []
         for tool in mcp_tools.tools:
@@ -165,7 +154,6 @@ class GeminiOrchestrator(BaseOrchestrator):
                 description=tool.description,
                 parameters=tool.inputSchema
             ))
-            
         self.model = genai.GenerativeModel(
             model_name='gemini-1.5-flash',
             tools=[GeminiTool(function_declarations=gemini_funcs)],
@@ -175,36 +163,28 @@ class GeminiOrchestrator(BaseOrchestrator):
 
     async def query(self, user_question: str) -> str:
         response = self.chat.send_message(user_question)
-        
         while True:
             try:
                 part = response.parts[0]
             except IndexError:
                 return response.text
-
             if fn := part.function_call:
                 fname = fn.name
                 fargs = dict(fn.args)
                 print(f"\n🔧 Gemini requesting: {fname}")
-                
                 try:
                     result = await self.session.call_tool(fname, fargs)
                     content_str = "".join([c.text for c in result.content if hasattr(c, "text")])
                     print(f"   Result: {content_str[:100]}...")
                 except Exception as e:
                     content_str = f"Error: {str(e)}"
-                
-                # Send result back
                 tool_response = Part(function_response=FunctionResponse(name=fname, response={'result': content_str}))
                 response = self.chat.send_message([tool_response])
             else:
                 return response.text
 
-# --- FACTORY FUNCTION FOR RUN.PY ---
 def TriageOrchestrator(api_key: str):
-    """Factory that returns the correct class based on env var"""
     provider = os.getenv("LLM_PROVIDER", "deepseek").lower()
-    
     if provider == "deepseek":
         print(f"🤖 Initializing DeepSeek Orchestrator")
         return DeepSeekOrchestrator(api_key)
@@ -212,4 +192,4 @@ def TriageOrchestrator(api_key: str):
         print(f"🤖 Initializing Gemini Orchestrator")
         return GeminiOrchestrator(api_key)
     else:
-        raise ValueError(f"Unknown LLM_PROVIDER: {provider}. Use 'deepseek' or 'gemini'.")
+        raise ValueError(f"Unknown LLM_PROVIDER: {provider}")

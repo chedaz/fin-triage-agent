@@ -10,38 +10,42 @@ Created on Sat Nov 22 05:22:44 2025
 main.py
 CLI Entrypoint for Financial Triage Engine MVP
 Orchestrates: Stream -> Agents -> Optimizer -> Recommendations
+Updates: Fixed f-string formatting error and added report path validation.
 """
 
 import argparse
 import logging
+import os
+import sys
 from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from models import StockPredictorANN, prepare_sequences, train_model, normalize_prices, denormalize_price
-from optimizer import optimize_portfolio, calculate_expected_returns, calculate_covariance_ledoit_wolf
-from stream import MarketStream
-from agents import MarketMaker, ForensicAccountant
+# Ensure we can import sibling modules if running as script
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from triage_engine.models import StockPredictorANN, prepare_sequences, train_model, normalize_prices
+from triage_engine.optimizer import optimize_portfolio, calculate_covariance_ledoit_wolf
+from triage_engine.stream import MarketStream
+from triage_engine.agents import MarketMaker, ForensicAccountant
 
 logging.basicConfig(
     level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format='%(levelname)s:%(name)s:%(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-def train_or_load_model(ticker: str, data_dir: str = './data', force_retrain: bool = False) -> tuple:
+def train_or_load_model(ticker: str, data_dir: str = '../data', force_retrain: bool = False) -> tuple:
     """
     Train ANN on historical data or load pre-trained model
-    
-    Returns:
-        (model, price_min, price_max) tuple
+    Returns: (model, price_min, price_max)
     """
-    model_path = Path(f'models/{ticker}_model.pth')
-    model_path.parent.mkdir(exist_ok=True)
+    # Ensure models directory exists
+    Path('models').mkdir(exist_ok=True)
     
+    model_path = Path(f'models/{ticker}_model.pth')
     model = StockPredictorANN()
     
     if model_path.exists() and not force_retrain:
@@ -52,7 +56,7 @@ def train_or_load_model(ticker: str, data_dir: str = './data', force_retrain: bo
         norm_path = Path(f'models/{ticker}_norm.npz')
         if norm_path.exists():
             norm_data = np.load(norm_path)
-            price_min, price_max = norm_data['min'], norm_data['max']
+            price_min, price_max = float(norm_data['min']), float(norm_data['max'])
         else:
             price_min, price_max = None, None
         
@@ -62,7 +66,11 @@ def train_or_load_model(ticker: str, data_dir: str = './data', force_retrain: bo
     logger.info(f"Training new model for {ticker}...")
     
     stream = MarketStream(data_dir)
-    df = stream.load_full_history(ticker)
+    try:
+        df = stream.load_full_history(ticker)
+    except Exception as e:
+        logger.error(f"Failed to load data for training: {e}")
+        sys.exit(1)
     
     prices = df['Close'].values
     
@@ -73,6 +81,10 @@ def train_or_load_model(ticker: str, data_dir: str = './data', force_retrain: bo
     X, y = prepare_sequences(normalized_prices, window_size=5)
     
     # 80/20 train/test split per Paper 1502.06434v1
+    if len(X) < 100:
+        logger.error("Insufficient data for training (need > 100 points)")
+        sys.exit(1)
+
     split_idx = int(len(X) * 0.8)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
@@ -84,12 +96,12 @@ def train_or_load_model(ticker: str, data_dir: str = './data', force_retrain: bo
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    # Train with early stopping (max 130k epochs per paper, but early stop if converged)
+    # Train with early stopping
     train_model(
         model,
         train_loader,
         val_loader=test_loader,
-        epochs=10000,  # Reduced for MVP; paper specifies 130k but early stopping handles it
+        epochs=10000, 
         learning_rate=0.001,
         early_stopping_patience=50
     )
@@ -124,9 +136,14 @@ def run_triage_engine(args):
     
     # Load financial report if provided
     if args.report:
-        forensic_agent.load_report(args.report)
-        health = forensic_agent.analyze()
-        logger.info(f"Financial Health Score: {health.score:.1f}/100 | {health.notes}")
+        report_path = Path(args.report)
+        if not report_path.exists():
+            logger.error(f"Report file not found: {report_path.absolute()}")
+            # Don't exit, just continue without report
+        else:
+            forensic_agent.load_report(str(report_path))
+            health = forensic_agent.analyze()
+            logger.info(f"Financial Health Score: {health.score:.1f}/100 | {health.notes}")
     
     # Step 3: Initialize market stream
     stream = MarketStream(data_dir=args.data_dir)
@@ -136,7 +153,7 @@ def run_triage_engine(args):
     logger.info("-" * 80)
     
     tick_count = 0
-    portfolio_rebalance_interval = args.rebalance_days  # Rebalance every N ticks
+    portfolio_rebalance_interval = args.rebalance_days 
     
     price_history = []
     return_history = []
@@ -162,53 +179,51 @@ def run_triage_engine(args):
         
         # Log decision
         if signal:
+            # FIX: Format strings explicitly to avoid f-string syntax errors
+            ann_str = f"{signal.predicted_price:.2f}" if signal.predicted_price is not None else "N/A"
+            rsi_str = f"{signal.rsi:.1f}" if signal.rsi is not None else "N/A"
+            macd_str = f"{signal.macd:.3f}" if signal.macd is not None else "N/A"
+
             log_msg = (
                 f"[{current_date.date()}] [{args.ticker}] "
                 f"Price: {current_price:.2f} | "
-                f"ANN Pred: {signal.predicted_price:.2f if signal.predicted_price else 'N/A'} | "
-                f"RSI: {signal.rsi:.1f if signal.rsi else 'N/A'} | "
-                f"MACD: {signal.macd:.3f if signal.macd else 'N/A'} | "
+                f"ANN Pred: {ann_str} | "
+                f"RSI: {rsi_str} | "
+                f"MACD: {macd_str} | "
                 f"Volatility: {signal.volatility_state} | "
                 f"Action: {signal.action} (Strength: {signal.strength:.1f})"
             )
             logger.info(log_msg)
         
-        # Portfolio rebalancing (every N days of simulation)
+        # Portfolio rebalancing
         if tick_count % portfolio_rebalance_interval == 0 and len(return_history) > 30:
             logger.info("\n" + "="*80)
             logger.info(f"PORTFOLIO REBALANCING TRIGGERED (Day {tick_count})")
             logger.info("="*80)
             
-            # For MVP, we'll simulate a simple single-asset "portfolio"
-            # In a real scenario, you'd have multiple tickers
-            
-            # Calculate expected return (blend historical + ANN prediction)
-            historical_mean_return = np.mean(return_history[-60:])  # Last 60 days
+            historical_mean_return = np.mean(return_history[-60:])
             
             if signal and signal.predicted_price:
                 ann_predicted_return = (signal.predicted_price - current_price) / current_price
                 mu_val = 0.5 * historical_mean_return + 0.5 * ann_predicted_return
             else:
                 mu_val = historical_mean_return
-
-            # --- TRIAGE LOGIC INTEGRATION ---
-            # If Forensic Score is low (<40), severely penalize expected return
+            
+            # Penalize if forensic health is poor
             if 'health' in locals() and health.score < 40:
-                logger.warning(f"Forensic Penalty Applied: Score {health.score}")
-                mu_val = mu_val * 0.5  # Cut expected return in half due to fundamental risk
+                logger.warning(f"Forensic Penalty Applied (Score {health.score}): Reducing Expected Return")
+                mu_val = mu_val * 0.5
             
             mu = np.array([mu_val])
             
-            # Calculate covariance (for single asset, just variance)
             recent_returns = np.array(return_history[-60:]).reshape(-1, 1)
             sigma = calculate_covariance_ledoit_wolf(recent_returns)
             
-            # Optimize (for single asset, this will just return w=1.0, but demonstrates the framework)
             result = optimize_portfolio(
                 expected_returns=mu,
                 covariance_matrix=sigma,
                 risk_aversion=args.risk_aversion,
-                max_weight=1.0  # Single asset
+                max_weight=1.0
             )
             
             logger.info(f"Optimal Weight: {result['weights'][0]:.2%}")
@@ -216,7 +231,6 @@ def run_triage_engine(args):
             logger.info(f"Portfolio Risk (σ): {result['risk']:.4f}" if result['risk'] else "N/A")
             logger.info("="*80 + "\n")
         
-        # Limit simulation if max_ticks specified
         if args.max_ticks and tick_count >= args.max_ticks:
             logger.info(f"\nReached max ticks limit ({args.max_ticks}). Stopping simulation.")
             break
@@ -228,92 +242,30 @@ def run_triage_engine(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Financial Triage Engine MVP - Stock Market Analysis & Portfolio Optimization"
-    )
-    
-    # Required arguments
-    parser.add_argument(
-        'ticker',
-        type=str,
-        help='Stock ticker symbol (must match CSV filename in data directory)'
-    )
-    
-    # Optional arguments
-    parser.add_argument(
-        '--data-dir',
-        type=str,
-        default='../data',
-        help='Directory containing CSV files (default: ../data)'
-    )
-    
-    parser.add_argument(
-        '--report',
-        type=str,
-        help='Path to JSON financial report for forensic analysis'
-    )
-    
-    parser.add_argument(
-        '--speed',
-        type=float,
-        default=0.0,
-        help='Playback speed in seconds between ticks (default: 0.0 = fastest)'
-    )
-    
-    parser.add_argument(
-        '--start-date',
-        type=str,
-        help='Start date for simulation (YYYY-MM-DD)'
-    )
-    
-    parser.add_argument(
-        '--end-date',
-        type=str,
-        help='End date for simulation (YYYY-MM-DD)'
-    )
-    
-    parser.add_argument(
-        '--rebalance-days',
-        type=int,
-        default=30,
-        help='Rebalance portfolio every N ticks/days (default: 30)'
-    )
-    
-    parser.add_argument(
-        '--risk-aversion',
-        type=float,
-        default=1.0,
-        help='Risk aversion parameter λ for optimization (default: 1.0)'
-    )
-    
-    parser.add_argument(
-        '--retrain',
-        action='store_true',
-        help='Force retrain ANN model even if saved model exists'
-    )
-    
-    parser.add_argument(
-        '--max-ticks',
-        type=int,
-        help='Maximum number of ticks to process (for testing)'
-    )
+    parser = argparse.ArgumentParser(description="Financial Triage Engine MVP")
+    parser.add_argument('ticker', type=str, help='Stock ticker symbol')
+    parser.add_argument('--data-dir', type=str, default='../data', help='Directory containing CSV files')
+    parser.add_argument('--report', type=str, help='Path to JSON financial report')
+    parser.add_argument('--speed', type=float, default=0.0, help='Playback speed')
+    parser.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
+    parser.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
+    parser.add_argument('--rebalance-days', type=int, default=30, help='Rebalance interval')
+    parser.add_argument('--risk-aversion', type=float, default=1.0, help='Risk aversion parameter')
+    parser.add_argument('--retrain', action='store_true', help='Force retrain ANN model')
+    parser.add_argument('--max-ticks', type=int, help='Max ticks to process')
     
     args = parser.parse_args()
     
-    # Validate data directory
     if not Path(args.data_dir).exists():
         logger.error(f"Data directory not found: {args.data_dir}")
-        logger.error("Please create the directory and add CSV files named as <TICKER>.csv")
         return
     
-    # Run the engine
     try:
         run_triage_engine(args)
     except KeyboardInterrupt:
         logger.info("\n\nSimulation interrupted by user")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
-
 
 if __name__ == '__main__':
     main()

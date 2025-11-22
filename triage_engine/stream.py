@@ -9,10 +9,8 @@ Created on Sat Nov 22 05:21:06 2025
 """
 stream.py
 Playback Engine for Historical CSV Data
-Simulates live market feed by streaming row-by-row
-Per Multi-Agent Triage Engine Design.pdf
+Updates: Added column normalization to handle NSE 'Mean Price'/'Price' headers
 """
-
 import pandas as pd
 import time
 from pathlib import Path
@@ -21,49 +19,65 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
 class MarketStream:
-    """
-    Mock streaming data source that replays historical CSV data
-    Simulates "Hot" pipeline without Kafka (per user constraint)
-    """
-    
     def __init__(self, data_dir: str = './data'):
-        """
-        Initialize the market stream
-        
-        Args:
-            data_dir: Directory containing CSV files
-        """
         self.data_dir = Path(data_dir)
         
-        if not self.data_dir.exists():
-            raise FileNotFoundError(f"Data directory not found: {data_dir}")
-            
-    def load_full_history(self, ticker: str) -> pd.DataFrame:
-        csv_path = self.data_dir / f"{ticker}.csv"
-        if not csv_path.exists():
-            raise FileNotFoundError(f"CSV not found: {csv_path}")
-        
-        df = pd.read_csv(csv_path)
+        # Mapping common NSE/Financial headers to standard OHLCV
+        self.column_map = {
+            'Mean Price': 'Close',
+            'Price': 'Close',
+            'Adj Close': 'Close',
+            'Previous': 'Close',      # Fallback if no close
+            'Day High': 'High',
+            'Day Low': 'Low',
+            'Tot Vol': 'Volume',
+            'Vol': 'Volume',
+            'Code': 'Ticker'
+        }
+    
+    def _normalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Standardize column names to Open, High, Low, Close, Volume"""
+        # Clean whitespace and title case existing columns
         df.columns = df.columns.str.strip().str.title()
         
-        # Fix Date
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-            df = df.dropna(subset=['Date']).sort_values('Date').reset_index(drop=True)
+        # Rename based on map
+        # Note: Title casing turns 'Mean Price' -> 'Mean Price', but 'CLOSE' -> 'Close'
+        # We need to match the title-cased keys in self.column_map if they match exactly,
+        # or do a flexible lookup.
         
-        # Fix Numeric columns & Missing values (Updated for new Pandas)
-        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-        # Use new ffill/bfill syntax
-        df = df.ffill().bfill().fillna(0.0)
+        new_names = {}
+        for col in df.columns:
+            # Check exact map
+            if col in self.column_map:
+                new_names[col] = self.column_map[col]
+            # Check title case map (e.g., 'Mean price' -> 'Mean Price')
+            elif col.title() in self.column_map:
+                new_names[col] = self.column_map[col.title()]
         
+        df.rename(columns=new_names, inplace=True)
+        
+        # CRITICAL: Ensure 'Close' exists
+        if 'Close' not in df.columns:
+            # If we have Open but no Close, use Open
+            if 'Open' in df.columns:
+                df['Close'] = df['Open']
+            # If we have nothing, look for ANY float column
+            else:
+                float_cols = df.select_dtypes(include=['float', 'int']).columns
+                if len(float_cols) > 0:
+                    logger.warning(f"No 'Close' column found. Defaulting to '{float_cols[0]}'")
+                    df['Close'] = df[float_cols[0]]
+        
+        # Fill missing OHLC if Close exists
+        if 'Close' in df.columns:
+            if 'Open' not in df.columns: df['Open'] = df['Close']
+            if 'High' not in df.columns: df['High'] = df['Close']
+            if 'Low' not in df.columns: df['Low'] = df['Close']
+            if 'Volume' not in df.columns: df['Volume'] = 0
+            
         return df
-    
+
     def playback(
         self,
         ticker: str,
@@ -71,110 +85,62 @@ class MarketStream:
         start_date: str = None,
         end_date: str = None
     ) -> Generator[Dict, None, None]:
-        """
-        Stream historical data row-by-row to simulate live feed
         
-        Args:
-            ticker: Stock ticker symbol (matches CSV filename)
-            speed: Delay between ticks in seconds (0.1 = 10 ticks/sec)
-            start_date: Optional start date filter (YYYY-MM-DD)
-            end_date: Optional end date filter (YYYY-MM-DD)
-        
-        Yields:
-            Dict containing: {
-                'Date': datetime,
-                'Open': float,
-                'High': float,
-                'Low': float,
-                'Close': float,
-                'Volume': int
-            }
-        """
-        csv_path = self.data_dir / f"{ticker}.csv"
-        
-        if not csv_path.exists():
-            raise FileNotFoundError(f"CSV not found for ticker: {ticker}")
-        
-        logger.info(f"Loading historical data for {ticker} from {csv_path}")
-        
-        # Read CSV with data normalization
-        df = pd.read_csv(csv_path)
-        
-        # Normalize column names (handle variations)
-        df.columns = df.columns.str.strip().str.title()
-        
-        # Ensure 'Date' column exists and convert to datetime
-        if 'Date' not in df.columns:
-            raise ValueError(f"CSV must contain 'Date' column. Found: {df.columns.tolist()}")
-        
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        
-        # Drop rows with invalid dates
-        df = df.dropna(subset=['Date'])
-        
+        try:
+            df = self.load_full_history(ticker)
+        except FileNotFoundError:
+            return
+
         # Filter by date range if specified
         if start_date:
             df = df[df['Date'] >= pd.to_datetime(start_date)]
         if end_date:
             df = df[df['Date'] <= pd.to_datetime(end_date)]
         
-        # Sort by date
-        df = df.sort_values('Date').reset_index(drop=True)
+        logger.info(f"Streaming {len(df)} ticks for {ticker}")
         
-        # Fill NaN values with forward fill, then backward fill
-        df = df.fillna(method='ffill').fillna(method='bfill')
-        
-        # Ensure numeric columns are floats
-        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-        
-        logger.info(f"Streaming {len(df)} ticks for {ticker} from {df['Date'].min()} to {df['Date'].max()}")
-        
-        # Stream row-by-row
         for idx, row in df.iterrows():
-            tick = {
+            yield {
                 'Date': row['Date'],
-                'Open': float(row.get('Open', 0)),
-                'High': float(row.get('High', 0)),
-                'Low': float(row.get('Low', 0)),
-                'Close': float(row.get('Close', 0)),
-                'Volume': int(row.get('Volume', 0))
+                'Open': float(row['Open']),
+                'High': float(row['High']),
+                'Low': float(row['Low']),
+                'Close': float(row['Close']),
+                'Volume': int(row['Volume'])
             }
-            
-            yield tick
-            
-            # Simulate real-time delay
             if speed > 0:
                 time.sleep(speed)
     
-    # def load_full_history(self, ticker: str) -> pd.DataFrame:
-    #     """
-    #     Load entire CSV into memory (for batch training)
+    def load_full_history(self, ticker: str) -> pd.DataFrame:
+        csv_path = self.data_dir / f"{ticker}.csv"
         
-    #     Args:
-    #         ticker: Stock ticker symbol
+        # Fallback: check if user provided file without extension or with different case
+        if not csv_path.exists():
+            # Try finding any file starting with ticker
+            candidates = list(self.data_dir.glob(f"{ticker}*.csv"))
+            if candidates:
+                csv_path = candidates[0]
+            else:
+                raise FileNotFoundError(f"CSV not found: {csv_path}")
         
-    #     Returns:
-    #         DataFrame with OHLCV data
-    #     """
-    #     csv_path = self.data_dir / f"{ticker}.csv"
+        df = pd.read_csv(csv_path)
         
-    #     if not csv_path.exists():
-    #         raise FileNotFoundError(f"CSV not found: {csv_path}")
+        # 1. Normalize Columns immediately
+        df = self._normalize_columns(df)
         
-    #     df = pd.read_csv(csv_path)
-    #     df.columns = df.columns.str.strip().str.title()
-    #     df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    #     df = df.dropna(subset=['Date']).sort_values('Date').reset_index(drop=True)
+        # 2. Fix Date
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date']).sort_values('Date').reset_index(drop=True)
+        else:
+             raise ValueError(f"CSV {csv_path} missing 'Date' column")
         
-    #     # Normalize numeric columns
-    #     numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-    #     for col in numeric_cols:
-    #         if col in df.columns:
-    #             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(method='ffill').fillna(0.0)
+        # 3. Numeric Conversion
+        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+        # 4. Fill Gaps
+        df = df.ffill().bfill().fillna(0.0)
         
-    #     logger.info(f"Loaded {len(df)} records for {ticker}")
-        
-    #     return df
+        return df
